@@ -10,14 +10,25 @@ Design notes:
   - Helper functions (_extract_eco_code, _extract_opening_name) pull test
     data dynamically from the response so test names stay data-agnostic.
   - Two tests exercise get_games_by_opening end-to-end (extra API calls).
+  - _month_range tests are pure unit tests (no network calls).
+  - get_games_batch tests hit the live API with a small range.
 """
 
 import re
+from datetime import date
 from typing import Any
+from unittest.mock import patch
 
 import pytest
+import requests
 
-from chesscompy.games import _eco_matches, get_games, get_games_by_opening
+from chesscompy.games import (
+    _eco_matches,
+    _month_range,
+    get_games,
+    get_games_batch,
+    get_games_by_opening,
+)
 
 # ---------------------------------------------------------------------------
 # Constants — single source of truth for test user and period
@@ -257,3 +268,174 @@ def test_public_api_empty_opening_returns_all(games):
     # This makes a real API call with no filter
     unfiltered = get_games_by_opening(USERNAME, "", YEAR, MONTH)
     assert len(unfiltered) == len(games)
+
+
+# ---------------------------------------------------------------------------
+# _month_range — pure unit tests (no network calls)
+# ---------------------------------------------------------------------------
+
+
+class TestMonthRange:
+    """Tests for the _month_range helper that generates (year, month) pairs."""
+
+    def test_single_month(self):
+        """A range where start == end should return exactly one pair."""
+        result = _month_range(date(2026, 1, 1), date(2026, 1, 31))
+        assert result == [(2026, 1)]
+
+    def test_same_month_different_days(self):
+        """Day-of-month is ignored — same year/month always gives one pair."""
+        result = _month_range(date(2026, 3, 15), date(2026, 3, 1))
+        assert result == [(2026, 3)]
+
+    def test_multi_month_same_year(self):
+        """Several months within the same year."""
+        result = _month_range(date(2026, 1, 1), date(2026, 4, 1))
+        assert result == [(2026, 1), (2026, 2), (2026, 3), (2026, 4)]
+
+    def test_cross_year_boundary(self):
+        """Range spanning a year boundary (Dec -> Jan)."""
+        result = _month_range(date(2025, 11, 1), date(2026, 2, 1))
+        assert result == [
+            (2025, 11), (2025, 12),
+            (2026, 1), (2026, 2),
+        ]
+
+    def test_full_year(self):
+        """All 12 months of a year."""
+        result = _month_range(date(2025, 1, 1), date(2025, 12, 1))
+        assert len(result) == 12
+        assert result[0] == (2025, 1)
+        assert result[-1] == (2025, 12)
+
+    def test_multi_year_span(self):
+        """Range spanning more than one year."""
+        result = _month_range(date(2024, 11, 1), date(2026, 2, 1))
+        # Nov 2024 -> Feb 2026 = 2 + 12 + 2 = 16 months
+        assert len(result) == 16
+        assert result[0] == (2024, 11)
+        assert result[-1] == (2026, 2)
+
+    def test_start_after_end_raises(self):
+        """Reversed range should raise ValueError."""
+        with pytest.raises(ValueError, match="after"):
+            _month_range(date(2026, 3, 1), date(2026, 1, 1))
+
+    def test_start_after_end_cross_year_raises(self):
+        """Reversed range across years should also raise."""
+        with pytest.raises(ValueError, match="after"):
+            _month_range(date(2026, 1, 1), date(2025, 12, 1))
+
+
+# ---------------------------------------------------------------------------
+# get_games_batch — live API integration tests
+# ---------------------------------------------------------------------------
+
+
+class TestGetGamesBatch:
+    """
+    Integration tests for batch fetching across multiple months.
+
+    These hit the live Chess.com API. We use a small date range
+    (just January 2026) for the basic test to keep it fast, and
+    a two-month range for the multi-month test.
+    """
+
+    def test_single_month_matches_get_games(self, games):
+        """
+        Batch with a one-month range should return the same games
+        as a direct get_games call for that month.
+        """
+        batch = get_games_batch(
+            USERNAME,
+            date(YEAR, MONTH, 1),
+            date(YEAR, MONTH, 28),
+        )
+        # Same count — and same game URLs (order-independent)
+        assert len(batch) == len(games)
+        assert {g["url"] for g in batch} == {g["url"] for g in games}
+
+    def test_multi_month_returns_superset(self):
+        """
+        Batch spanning two months should return at least as many
+        games as a single-month fetch.
+        """
+        single = get_games(USERNAME, YEAR, MONTH)
+        batch = get_games_batch(
+            USERNAME,
+            date(2025, 12, 1),
+            date(YEAR, MONTH, 1),
+        )
+        # The batch covers Dec 2025 + Jan 2026, so it should be >= Jan alone
+        assert len(batch) >= len(single)
+        # All January games should appear in the batch
+        single_urls = {g["url"] for g in single}
+        batch_urls = {g["url"] for g in batch}
+        assert single_urls.issubset(batch_urls)
+
+    def test_chronological_order(self):
+        """
+        Games should be ordered by month — all Dec games before Jan games.
+        We verify by checking end_time timestamps are non-decreasing across
+        month boundaries (games within a month are already chronological).
+        """
+        batch = get_games_batch(
+            USERNAME,
+            date(2025, 12, 1),
+            date(YEAR, MONTH, 1),
+        )
+        if len(batch) < 2:
+            pytest.skip("Need at least 2 games to test ordering")
+
+        # Find the boundary: last Dec game and first Jan game
+        dec_games = [g for g in batch if g.get("end_time", 0) < 1735689600]
+        jan_games = [g for g in batch if g.get("end_time", 0) >= 1735689600]
+
+        if dec_games and jan_games:
+            last_dec_time = dec_games[-1].get("end_time", 0)
+            first_jan_time = jan_games[0].get("end_time", 0)
+            assert last_dec_time <= first_jan_time, (
+                "December games should come before January games"
+            )
+
+    def test_invalid_range_raises(self):
+        """Reversed date range should raise ValueError, not make API calls."""
+        with pytest.raises(ValueError, match="after"):
+            get_games_batch(USERNAME, date(2026, 3, 1), date(2026, 1, 1))
+
+    def test_strict_error_on_bad_username(self):
+        """
+        Strict mode: a request that triggers an HTTP error should propagate
+        the exception — no partial results, no silent failures.
+
+        We use a username that will 404 to trigger the error.
+        """
+        with pytest.raises(requests.HTTPError):
+            get_games_batch(
+                "this-user-definitely-does-not-exist-xyz-999",
+                date(YEAR, MONTH, 1),
+                date(YEAR, MONTH, 1),
+            )
+
+    def test_strict_error_propagates_from_concurrent_workers(self):
+        """
+        When one month in a multi-month batch fails, strict mode should
+        propagate the exception even though other months may succeed.
+
+        We mock one of the months to fail while the other would succeed.
+        """
+        def failing_get_games(username, year, month):
+            """Simulate the second month failing with an HTTP error."""
+            if month == 2:
+                resp = requests.Response()
+                resp.status_code = 404
+                raise requests.HTTPError(response=resp)
+            return get_games(username, year, month)
+
+        with patch("chesscompy.games.get_games", side_effect=failing_get_games):
+            with pytest.raises(requests.HTTPError):
+                get_games_batch(
+                    USERNAME,
+                    date(YEAR, MONTH, 1),
+                    date(YEAR, 2, 1),
+                )
