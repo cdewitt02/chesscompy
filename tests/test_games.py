@@ -22,12 +22,17 @@ from unittest.mock import patch
 import pytest
 import requests
 
+from chesscompy.exceptions import ChessComAPIError, PlayerNotFoundError
 from chesscompy.games import (
     _eco_matches,
+    _is_loss,
     _month_range,
+    _time_class_matches,
+    filter_by_time_control,
     get_games,
     get_games_batch,
     get_games_by_opening,
+    get_recent_losses,
 )
 
 # ---------------------------------------------------------------------------
@@ -410,7 +415,7 @@ class TestGetGamesBatch:
 
         We use a username that will 404 to trigger the error.
         """
-        with pytest.raises(requests.HTTPError):
+        with pytest.raises(PlayerNotFoundError):
             get_games_batch(
                 "this-user-definitely-does-not-exist-xyz-999",
                 date(YEAR, MONTH, 1),
@@ -425,17 +430,335 @@ class TestGetGamesBatch:
         We mock one of the months to fail while the other would succeed.
         """
         def failing_get_games(username, year, month):
-            """Simulate the second month failing with an HTTP error."""
+            """Simulate the second month failing with a ChessComAPIError."""
             if month == 2:
-                resp = requests.Response()
-                resp.status_code = 404
-                raise requests.HTTPError(response=resp)
+                raise ChessComAPIError("Simulated failure for month 2")
             return get_games(username, year, month)
 
         with patch("chesscompy.games.get_games", side_effect=failing_get_games):
-            with pytest.raises(requests.HTTPError):
+            with pytest.raises(ChessComAPIError):
                 get_games_batch(
                     USERNAME,
                     date(YEAR, MONTH, 1),
                     date(YEAR, 2, 1),
                 )
+
+
+# ---------------------------------------------------------------------------
+# _is_loss — unit tests for loss detection helper
+# ---------------------------------------------------------------------------
+
+
+class TestIsLoss:
+    """
+    Unit tests for the _is_loss helper function.
+
+    Chess.com uses various result strings to indicate how a game ended.
+    A "loss" is when the player was on the losing side — checkmated,
+    resigned, timed out, etc. Draws and wins should return False.
+    """
+
+    # ----- Losing results (should return True) -----
+
+    def test_checkmated_is_loss(self):
+        """Player who got checkmated lost the game."""
+        game = {
+            "white": {"username": "alice", "result": "checkmated"},
+            "black": {"username": "bob", "result": "win"},
+        }
+        assert _is_loss(game, "alice") is True
+        assert _is_loss(game, "bob") is False
+
+    def test_resigned_is_loss(self):
+        """Player who resigned lost the game."""
+        game = {
+            "white": {"username": "alice", "result": "win"},
+            "black": {"username": "bob", "result": "resigned"},
+        }
+        assert _is_loss(game, "bob") is True
+        assert _is_loss(game, "alice") is False
+
+    def test_timeout_is_loss(self):
+        """Player who ran out of time lost the game."""
+        game = {
+            "white": {"username": "alice", "result": "timeout"},
+            "black": {"username": "bob", "result": "win"},
+        }
+        assert _is_loss(game, "alice") is True
+
+    def test_abandoned_is_loss(self):
+        """Player who abandoned the game lost."""
+        game = {
+            "white": {"username": "alice", "result": "abandoned"},
+            "black": {"username": "bob", "result": "win"},
+        }
+        assert _is_loss(game, "alice") is True
+
+    # ----- Non-losing results (should return False) -----
+
+    def test_win_is_not_loss(self):
+        """Winner did not lose."""
+        game = {
+            "white": {"username": "alice", "result": "win"},
+            "black": {"username": "bob", "result": "checkmated"},
+        }
+        assert _is_loss(game, "alice") is False
+
+    def test_draw_stalemate_is_not_loss(self):
+        """Stalemate is a draw, not a loss for either player."""
+        game = {
+            "white": {"username": "alice", "result": "stalemate"},
+            "black": {"username": "bob", "result": "stalemate"},
+        }
+        assert _is_loss(game, "alice") is False
+        assert _is_loss(game, "bob") is False
+
+    def test_draw_agreed_is_not_loss(self):
+        """Draw by agreement is not a loss."""
+        game = {
+            "white": {"username": "alice", "result": "agreed"},
+            "black": {"username": "bob", "result": "agreed"},
+        }
+        assert _is_loss(game, "alice") is False
+        assert _is_loss(game, "bob") is False
+
+    def test_draw_repetition_is_not_loss(self):
+        """Draw by repetition is not a loss."""
+        game = {
+            "white": {"username": "alice", "result": "repetition"},
+            "black": {"username": "bob", "result": "repetition"},
+        }
+        assert _is_loss(game, "alice") is False
+        assert _is_loss(game, "bob") is False
+
+    def test_draw_insufficient_is_not_loss(self):
+        """Draw by insufficient material is not a loss."""
+        game = {
+            "white": {"username": "alice", "result": "insufficient"},
+            "black": {"username": "bob", "result": "insufficient"},
+        }
+        assert _is_loss(game, "alice") is False
+        assert _is_loss(game, "bob") is False
+
+    def test_draw_50move_is_not_loss(self):
+        """Draw by 50-move rule is not a loss."""
+        game = {
+            "white": {"username": "alice", "result": "50move"},
+            "black": {"username": "bob", "result": "50move"},
+        }
+        assert _is_loss(game, "alice") is False
+        assert _is_loss(game, "bob") is False
+
+    def test_draw_timevsinsufficient_is_not_loss(self):
+        """Timeout vs insufficient material is a draw, not a loss."""
+        game = {
+            "white": {"username": "alice", "result": "timevsinsufficient"},
+            "black": {"username": "bob", "result": "timevsinsufficient"},
+        }
+        assert _is_loss(game, "alice") is False
+        assert _is_loss(game, "bob") is False
+
+    # ----- Edge cases -----
+
+    def test_username_case_insensitive(self):
+        """Username matching should be case-insensitive (Chess.com usernames are)."""
+        game = {
+            "white": {"username": "Alice", "result": "checkmated"},
+            "black": {"username": "Bob", "result": "win"},
+        }
+        # Query with different casing should still work
+        assert _is_loss(game, "alice") is True
+        assert _is_loss(game, "ALICE") is True
+        assert _is_loss(game, "bob") is False
+
+    def test_username_not_in_game_returns_false(self):
+        """If the username isn't in the game at all, return False."""
+        game = {
+            "white": {"username": "alice", "result": "win"},
+            "black": {"username": "bob", "result": "checkmated"},
+        }
+        assert _is_loss(game, "charlie") is False
+
+
+# ---------------------------------------------------------------------------
+# get_recent_losses — live API integration tests
+# ---------------------------------------------------------------------------
+
+
+class TestGetRecentLosses:
+    """
+    Integration tests for fetching recent losses from the live Chess.com API.
+
+    These tests verify that:
+      - Only games where the user lost are returned
+      - The limit parameter is respected
+      - Results are in reverse chronological order (most recent first)
+    """
+
+    def test_returns_only_losses(self):
+        """
+        Every game returned should be a loss for the specified username.
+
+        We verify by checking the result field for the user's color.
+        """
+        losses = get_recent_losses(USERNAME, limit=5)
+
+        # Skip if the user has no losses in recent history
+        if not losses:
+            pytest.skip(f"User {USERNAME} has no recent losses to test")
+
+        for game in losses:
+            assert _is_loss(game, USERNAME), (
+                f"Game {game.get('url')} was returned but is not a loss for {USERNAME}"
+            )
+
+    def test_respects_limit(self):
+        """
+        Should return at most `limit` games.
+        """
+        limit = 3
+        losses = get_recent_losses(USERNAME, limit=limit)
+        assert len(losses) <= limit
+
+    def test_default_limit_is_10(self):
+        """
+        Default limit should be 10 when not specified.
+        """
+        losses = get_recent_losses(USERNAME)
+        assert len(losses) <= 10
+
+    def test_returns_most_recent_first(self):
+        """
+        Games should be in reverse chronological order — most recent loss first.
+
+        We verify by checking that end_time values are non-increasing.
+        """
+        losses = get_recent_losses(USERNAME, limit=5)
+
+        if len(losses) < 2:
+            pytest.skip("Need at least 2 losses to test ordering")
+
+        end_times = [g.get("end_time", 0) for g in losses]
+        for i in range(len(end_times) - 1):
+            assert end_times[i] >= end_times[i + 1], (
+                f"Games not in reverse chronological order: "
+                f"game {i} ended at {end_times[i]}, game {i+1} at {end_times[i+1]}"
+            )
+
+    def test_nonexistent_user_raises(self):
+        """
+        Querying for a nonexistent user should raise PlayerNotFoundError.
+        """
+        with pytest.raises(PlayerNotFoundError):
+            get_recent_losses("this-user-definitely-does-not-exist-xyz-999", limit=1)
+
+    def test_time_control_filter(self):
+        """
+        When time_control is specified, only losses from that format are returned.
+        """
+        losses = get_recent_losses(USERNAME, limit=20, time_control="blitz")
+
+        if not losses:
+            pytest.skip(f"User {USERNAME} has no recent blitz losses")
+
+        for game in losses:
+            assert game.get("time_class") == "blitz", (
+                f"Game {game.get('url')} has time_class "
+                f"'{game.get('time_class')}', expected 'blitz'"
+            )
+
+    def test_since_filter_excludes_old_games(self):
+        """
+        When since is provided, only games with end_time > since are returned.
+
+        We fetch losses without filter, grab a mid-list timestamp, then
+        re-fetch with since=that timestamp and confirm the result is smaller.
+        """
+        all_losses = get_recent_losses(USERNAME, limit=10)
+
+        if len(all_losses) < 3:
+            pytest.skip("Need at least 3 losses to test 'since' filter")
+
+        # Pick a timestamp from the middle of the list
+        mid_idx = len(all_losses) // 2
+        cutoff = all_losses[mid_idx].get("end_time", 0)
+
+        filtered = get_recent_losses(USERNAME, limit=10, since=cutoff)
+
+        # Every filtered game should have end_time > cutoff
+        for game in filtered:
+            assert game.get("end_time", 0) > cutoff
+
+        # Filtered list should be a subset of the original
+        assert len(filtered) <= len(all_losses)
+
+
+# ---------------------------------------------------------------------------
+# _time_class_matches — unit tests for time control filter
+# ---------------------------------------------------------------------------
+
+
+class TestTimeClassMatches:
+    """Unit tests for the _time_class_matches helper."""
+
+    def test_none_matches_everything(self):
+        """None time_control means no filter — should always match."""
+        assert _time_class_matches({"time_class": "blitz"}, None) is True
+        assert _time_class_matches({"time_class": "rapid"}, None) is True
+        assert _time_class_matches({}, None) is True
+
+    def test_exact_match(self):
+        """Matching time class should return True."""
+        assert _time_class_matches({"time_class": "blitz"}, "blitz") is True
+        assert _time_class_matches({"time_class": "rapid"}, "rapid") is True
+        assert _time_class_matches({"time_class": "bullet"}, "bullet") is True
+        assert _time_class_matches({"time_class": "daily"}, "daily") is True
+
+    def test_case_insensitive(self):
+        """Matching should be case-insensitive."""
+        assert _time_class_matches({"time_class": "Blitz"}, "blitz") is True
+        assert _time_class_matches({"time_class": "blitz"}, "BLITZ") is True
+
+    def test_mismatch(self):
+        """Non-matching time class should return False."""
+        assert _time_class_matches({"time_class": "blitz"}, "rapid") is False
+        assert _time_class_matches({"time_class": "bullet"}, "daily") is False
+
+    def test_missing_time_class(self):
+        """Game without time_class field should not match any specific filter."""
+        assert _time_class_matches({}, "blitz") is False
+
+
+# ---------------------------------------------------------------------------
+# filter_by_time_control — public filter function
+# ---------------------------------------------------------------------------
+
+
+class TestFilterByTimeControl:
+    """Unit tests for the standalone filter_by_time_control function."""
+
+    def test_filters_correctly(self):
+        """Should return only games matching the requested time control."""
+        games = [
+            {"url": "g1", "time_class": "blitz"},
+            {"url": "g2", "time_class": "rapid"},
+            {"url": "g3", "time_class": "blitz"},
+            {"url": "g4", "time_class": "bullet"},
+        ]
+        result = filter_by_time_control(games, "blitz")
+        assert len(result) == 2
+        assert all(g["time_class"] == "blitz" for g in result)
+
+    def test_empty_list(self):
+        """Filtering an empty list should return an empty list."""
+        assert filter_by_time_control([], "rapid") == []
+
+    def test_no_matches(self):
+        """When no games match, should return an empty list."""
+        games = [{"url": "g1", "time_class": "blitz"}]
+        assert filter_by_time_control(games, "daily") == []
+
+    def test_invalid_time_control_raises(self):
+        """An unrecognized time control value should raise ValueError."""
+        with pytest.raises(ValueError, match="Invalid time_control"):
+            filter_by_time_control([], "ultrafast")

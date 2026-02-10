@@ -15,6 +15,56 @@ from typing import Any
 from chesscompy._client import get, games_url
 
 
+# ---------------------------------------------------------------------------
+# Loss detection — identify games where a player lost
+# ---------------------------------------------------------------------------
+
+# Chess.com result strings that indicate a loss for the player.
+# These are the possible values when a player is on the *losing* side.
+# Note: "win" means the player won, draws have their own result strings.
+LOSS_RESULTS = frozenset({
+    "checkmated",    # Lost by checkmate
+    "resigned",      # Player resigned
+    "timeout",       # Ran out of time (opponent had mating material)
+    "abandoned",     # Left the game
+    "kingofthehill", # Lost in King of the Hill variant
+    "threecheck",    # Lost in Three-Check variant
+    "bughousepartnerlose",  # Partner lost in Bughouse
+})
+
+
+def _is_loss(game: dict[str, Any], username: str) -> bool:
+    """
+    Determine if the given game is a loss for the specified username.
+
+    How it works:
+      1. Find which color (white/black) the user played by matching username
+      2. Check if that color's result is in the set of losing results
+
+    Chess.com usernames are case-insensitive, so we normalize to lowercase.
+
+    :param game: Game dict from the Chess.com API.
+    :param username: The username to check for a loss.
+    :return: True if the user lost this game, False otherwise.
+    """
+    username_lower = username.lower()
+
+    # Each game has 'white' and 'black' dicts with 'username' and 'result'
+    white = game.get("white", {})
+    black = game.get("black", {})
+
+    # Determine which color the user played (if any)
+    if white.get("username", "").lower() == username_lower:
+        result = white.get("result", "")
+    elif black.get("username", "").lower() == username_lower:
+        result = black.get("result", "")
+    else:
+        # User not in this game
+        return False
+
+    return result in LOSS_RESULTS
+
+
 def get_games(username: str, year: int, month: int) -> list[dict[str, Any]]:
     """
     Fetch all games for a player in a given month (direct Chess.com API).
@@ -26,10 +76,62 @@ def get_games(username: str, year: int, month: int) -> list[dict[str, Any]]:
     :raises requests.HTTPError: On 4xx/5xx from the API.
     """
     url = games_url(username, year, month)
-    resp = get(url)
-    resp.raise_for_status()
+    # context=username gives the error handler enough info for a
+    # clear PlayerNotFoundError message on 404
+    resp = get(url, context=username)
     data = resp.json()
     return data.get("games", [])
+
+
+# ---------------------------------------------------------------------------
+# Time control filtering — filter games by bullet/blitz/rapid/daily
+# ---------------------------------------------------------------------------
+
+# Valid time class values from the Chess.com API
+VALID_TIME_CLASSES = frozenset({"bullet", "blitz", "rapid", "daily"})
+
+
+def _time_class_matches(game: dict[str, Any], time_control: str | None) -> bool:
+    """
+    Return True if this game's time class matches the requested filter.
+
+    :param game: Game dict from the Chess.com API.
+    :param time_control: One of "bullet", "blitz", "rapid", "daily", or None.
+                         None means no filter — always returns True.
+    :return: True if the game matches (or no filter is set).
+    """
+    if time_control is None:
+        return True
+    return game.get("time_class", "").lower() == time_control.lower()
+
+
+def filter_by_time_control(
+    games: list[dict[str, Any]],
+    time_control: str,
+) -> list[dict[str, Any]]:
+    """
+    Filter a list of games to only those matching a specific time control.
+
+    Useful when the caller already has a game list (e.g. from get_games_batch)
+    and wants to narrow it down without re-fetching.
+
+    :param games: List of game dicts from the Chess.com API.
+    :param time_control: One of "bullet", "blitz", "rapid", "daily".
+    :return: Filtered list of games matching the time control.
+    :raises ValueError: If time_control is not a recognized value.
+    """
+    tc = time_control.strip().lower()
+    if tc not in VALID_TIME_CLASSES:
+        raise ValueError(
+            f"Invalid time_control '{time_control}'. "
+            f"Must be one of: {', '.join(sorted(VALID_TIME_CLASSES))}"
+        )
+    return [g for g in games if _time_class_matches(g, tc)]
+
+
+# ---------------------------------------------------------------------------
+# Opening filter — match by ECO code or opening name substring
+# ---------------------------------------------------------------------------
 
 
 def _eco_matches(game: dict[str, Any], opening: str) -> bool:
@@ -142,6 +244,8 @@ def get_games_batch(
     end: date,
     *,
     max_workers: int = 5,
+    time_control: str | None = None,
+    since: int | None = None,
 ) -> list[dict[str, Any]]:
     """
     Fetch games across a multi-month date range using concurrent requests.
@@ -150,49 +254,60 @@ def get_games_batch(
     running up to *max_workers* requests in parallel via a thread pool.
     Threads are ideal here because each task is I/O-bound (network wait).
 
+    Optional client-side filters are applied *after* all months are fetched:
+      - *time_control*: keep only games of a specific type (bullet/blitz/rapid/daily)
+      - *since*: keep only games whose ``end_time`` is strictly after this epoch
+
     **Strict error handling**: if ANY single month's request fails, the
     exception propagates immediately — no partial results are returned.
-    This uses ``future.result()`` which re-raises worker-thread exceptions
-    on the calling thread.
 
-    :param username:    Chess.com username.
-    :param start:       Start date (day ignored; only year/month used).
-    :param end:         End date   (day ignored; only year/month used).
-    :param max_workers: Max concurrent API requests. Chess.com may rate-limit
-                        aggressive clients; 5 is a safe default.
+    :param username:     Chess.com username.
+    :param start:        Start date (day ignored; only year/month used).
+    :param end:          End date   (day ignored; only year/month used).
+    :param max_workers:  Max concurrent API requests (default 5).
+    :param time_control: Optional filter — "bullet", "blitz", "rapid", or "daily".
+    :param since:        Optional Unix epoch — exclude games with end_time <= since.
     :return: Combined list of game dicts, ordered chronologically by month.
     :raises ValueError:          If start is after end.
-    :raises requests.HTTPError:  If any month's API request fails (strict).
+    :raises ChessComAPIError:    If any month's API request fails (strict).
     """
     months = _month_range(start, end)
 
     # Single month: skip thread-pool overhead entirely
     if len(months) == 1:
         y, m = months[0]
-        return get_games(username, y, m)
+        all_games = get_games(username, y, m)
+    else:
+        # Fan out one request per month across the thread pool
+        results: dict[tuple[int, int], list[dict[str, Any]]] = {}
 
-    # Fan out one request per month across the thread pool
-    results: dict[tuple[int, int], list[dict[str, Any]]] = {}
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all months at once — the pool caps concurrency at max_workers
+            future_to_month = {
+                executor.submit(get_games, username, y, m): (y, m)
+                for y, m in months
+            }
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all months at once — the pool caps concurrency at max_workers
-        future_to_month = {
-            executor.submit(get_games, username, y, m): (y, m)
-            for y, m in months
-        }
+            # Collect results as they complete (order doesn't matter yet)
+            for future in as_completed(future_to_month):
+                month_key = future_to_month[future]
+                # .result() re-raises any exception the worker hit.
+                # In strict mode this means one bad month kills the whole batch.
+                results[month_key] = future.result()
 
-        # Collect results as they complete (order doesn't matter yet)
-        for future in as_completed(future_to_month):
-            month_key = future_to_month[future]
-            # .result() re-raises any exception the worker hit.
-            # In strict mode this means one bad month kills the whole batch.
-            results[month_key] = future.result()
+        # Reassemble in chronological order — as_completed returns in *finish*
+        # order, not submission order, so we iterate over the original month list.
+        all_games = []
+        for ym in months:
+            all_games.extend(results[ym])
 
-    # Reassemble in chronological order — as_completed returns in *finish*
-    # order, not submission order, so we iterate over the original month list.
-    out: list[dict[str, Any]] = []
-    for ym in months:
-        out.extend(results[ym])
+    # Apply optional client-side filters
+    out = all_games
+    if time_control is not None:
+        out = [g for g in out if _time_class_matches(g, time_control)]
+    if since is not None:
+        out = [g for g in out if g.get("end_time", 0) > since]
+
     return out
 
 
@@ -229,3 +344,91 @@ def get_games_batch_by_opening(
     all_games = get_games_batch(username, start, end, max_workers=max_workers)
     # Filter locally — _eco_matches handles empty/whitespace opening gracefully
     return [g for g in all_games if _eco_matches(g, opening)]
+
+
+# ---------------------------------------------------------------------------
+# Recent losses — fetch games where the user lost (most recent first)
+# ---------------------------------------------------------------------------
+
+
+def get_recent_losses(
+    username: str,
+    limit: int = 10,
+    *,
+    max_months: int = 12,
+    time_control: str | None = None,
+    since: int | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Fetch the user's most recent lost games, up to `limit` games.
+
+    Strategy:
+      - Start from the current month and work backwards
+      - Fetch one month at a time, filtering for losses
+      - Stop as soon as we have `limit` losses (avoids over-fetching)
+      - Give up after `max_months` to prevent unbounded API calls
+
+    Optional filters narrow the results further:
+      - *time_control*: only include losses from a specific format
+        (e.g. "blitz", "rapid") — useful because the SaaS needs different
+        Stockfish analysis depths per format.
+      - *since*: only include losses whose ``end_time`` is strictly after
+        this Unix epoch — enables incremental analysis (skip already-analyzed
+        games).
+
+    Results are returned in reverse chronological order — most recent first.
+    Games within each month are reversed since the API returns oldest-first.
+
+    :param username: Chess.com username.
+    :param limit: Maximum number of losses to return (default 10).
+    :param max_months: How many months back to search (default 12).
+    :param time_control: Optional filter — "bullet", "blitz", "rapid", or "daily".
+    :param since: Optional Unix epoch — exclude games with end_time <= since.
+    :return: List of game dicts where the user lost, most recent first.
+    :raises ChessComAPIError: If any API request fails.
+    """
+    losses: list[dict[str, Any]] = []
+    today = date.today()
+    year, month = today.year, today.month
+
+    # Walk backwards through months until we have enough losses or hit max
+    for _ in range(max_months):
+        # Fetch all games for this month
+        games = get_games(username, year, month)
+
+        # Filter for losses and reverse to get most-recent-first within month
+        # (API returns games in chronological order, oldest first)
+        month_losses = [g for g in games if _is_loss(g, username)]
+
+        # Apply optional time control filter
+        if time_control is not None:
+            month_losses = [
+                g for g in month_losses if _time_class_matches(g, time_control)
+            ]
+
+        # Apply optional "since" filter — skip games already analyzed
+        if since is not None:
+            month_losses = [
+                g for g in month_losses if g.get("end_time", 0) > since
+            ]
+
+        month_losses.reverse()
+
+        # Add losses from this month, but don't exceed limit
+        for loss in month_losses:
+            if len(losses) >= limit:
+                break
+            losses.append(loss)
+
+        # Stop early if we have enough
+        if len(losses) >= limit:
+            break
+
+        # Move to previous month
+        if month == 1:
+            year -= 1
+            month = 12
+        else:
+            month -= 1
+
+    return losses

@@ -1,5 +1,5 @@
 """
-Quick CLI for manually testing get_games_batch and get_games_batch_by_opening.
+Quick CLI for manually testing chesscompy against the live Chess.com API.
 
 Usage examples:
     # Single month
@@ -11,10 +11,21 @@ Usage examples:
     # Filter by opening — ECO code or name substring
     python cli.py cdew4 2025-10 2026-01 --opening B07
     python cli.py cdew4 2025-10 2026-01 -o Pirc-Defense
-    python cli.py cdew4 2025-10 2026-01 -o Caro-Kann
+
+    # Filter by time control (bullet, blitz, rapid, daily)
+    python cli.py cdew4 2025-10 2026-01 --time-control blitz
+
+    # Only show losses
+    python cli.py cdew4 2025-10 2026-01 --losses-only
+
+    # Incremental fetch: only games after a given Unix timestamp
+    python cli.py cdew4 2025-10 2026-01 --since 1704067200
 
     # With custom concurrency limit
     python cli.py cdew4 2025-10 2026-01 --workers 3
+
+    # Combine filters
+    python cli.py cdew4 2025-10 2026-01 --time-control rapid --losses-only -v
 
     # Show full game details (verbose)
     python cli.py cdew4 2026-01 -v
@@ -26,7 +37,11 @@ import time
 from collections import Counter
 from datetime import date
 
-from chesscompy.games import get_games_batch, get_games_batch_by_opening
+from chesscompy.games import (
+    _is_loss,
+    get_games_batch,
+    get_games_batch_by_opening,
+)
 
 
 def parse_month(value: str) -> date:
@@ -48,7 +63,7 @@ def parse_month(value: str) -> date:
 def summarize(games: list[dict], verbose: bool = False) -> None:
     """Print a human-readable summary of the fetched games."""
     if not games:
-        print("No games found in the given range.")
+        print("No games found matching the given filters.")
         return
 
     print(f"\nTotal games: {len(games)}")
@@ -83,14 +98,16 @@ def summarize(games: list[dict], verbose: bool = False) -> None:
             black = g.get("black", {}).get("username", "?")
             tc = g.get("time_class", "?")
             eco = g.get("eco", "n/a")
-            print(f"  {white} vs {black}  [{tc}]")
+            w_result = g.get("white", {}).get("result", "?")
+            b_result = g.get("black", {}).get("result", "?")
+            print(f"  {white} ({w_result}) vs {black} ({b_result})  [{tc}]")
             print(f"    opening: {eco}")
             print(f"    url:     {url}\n")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Manually test get_games_batch against the Chess.com API."
+        description="Test chesscompy against the live Chess.com API.",
     )
     parser.add_argument(
         "username",
@@ -121,6 +138,24 @@ def main() -> None:
         help='Filter by opening: ECO code (e.g. "B07") or name (e.g. "Pirc-Defense")',
     )
     parser.add_argument(
+        "--time-control", "-t",
+        type=str,
+        default=None,
+        choices=["bullet", "blitz", "rapid", "daily"],
+        help="Filter by time control (bullet, blitz, rapid, daily)",
+    )
+    parser.add_argument(
+        "--losses-only", "-l",
+        action="store_true",
+        help="Only show games where the user lost",
+    )
+    parser.add_argument(
+        "--since", "-s",
+        type=int,
+        default=None,
+        help="Only show games after this Unix timestamp (for incremental fetching)",
+    )
+    parser.add_argument(
         "--verbose", "-v",
         action="store_true",
         help="Show individual game details",
@@ -132,19 +167,28 @@ def main() -> None:
     end = args.end if args.end is not None else args.start
 
     # Build a description string for the console output
-    opening_desc = f", opening='{args.opening}'" if args.opening else ""
+    filters = []
+    if args.opening:
+        filters.append(f"opening='{args.opening}'")
+    if args.time_control:
+        filters.append(f"time_control={args.time_control}")
+    if args.losses_only:
+        filters.append("losses only")
+    if args.since:
+        filters.append(f"since={args.since}")
+    filter_desc = f" [{', '.join(filters)}]" if filters else ""
+
     print(
         f"Fetching games for '{args.username}' "
         f"from {args.start.year}-{args.start.month:02d} "
         f"to {end.year}-{end.month:02d} "
-        f"(max_workers={args.workers}{opening_desc})..."
+        f"(max_workers={args.workers}{filter_desc})..."
     )
 
     t0 = time.perf_counter()
     try:
         # Use the opening-filtered variant when an opening is specified;
-        # otherwise fetch everything. Both use the same concurrent batch
-        # fetcher under the hood — the only difference is the post-filter.
+        # otherwise use the base batch fetcher with optional filters.
         if args.opening:
             games = get_games_batch_by_opening(
                 args.username, args.opening, args.start, end,
@@ -154,9 +198,30 @@ def main() -> None:
             games = get_games_batch(
                 args.username, args.start, end,
                 max_workers=args.workers,
+                time_control=args.time_control,
+                since=args.since,
             )
+
+        # --losses-only: filter to only losses for the given user
+        if args.losses_only:
+            games = [g for g in games if _is_loss(g, args.username)]
+
+        # If opening path was used, apply time_control/since filters manually
+        # (get_games_batch_by_opening doesn't have those params built in)
+        if args.opening:
+            if args.time_control:
+                games = [
+                    g for g in games
+                    if g.get("time_class", "").lower() == args.time_control
+                ]
+            if args.since:
+                games = [
+                    g for g in games
+                    if g.get("end_time", 0) > args.since
+                ]
+
     except Exception as exc:
-        # Strict mode: surface the error clearly
+        # Surface the error clearly
         print(f"\nERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
         sys.exit(1)
     elapsed = time.perf_counter() - t0
