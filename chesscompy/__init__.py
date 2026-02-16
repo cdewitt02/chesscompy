@@ -13,7 +13,7 @@ Example:
     # Filter by opening
     pirc_games = get_games_by_opening("cdew4", "B07", 2026, 1)
 
-    # Batch fetch across a date range (concurrent)
+    # Batch fetch across a date range (sequential, one API call per month)
     batch = get_games_batch("cdew4", date(2025, 10, 1), date(2026, 1, 31))
 
     # Batch with filters: only blitz games since a timestamp

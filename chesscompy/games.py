@@ -3,12 +3,11 @@ Games endpoint: fetch by month (Chess.com API) and by opening (client-side filte
 
 The official API only supports: GET /player/{username}/games/{YYYY}/{MM}.
 To support "by opening" we fetch one or more months and filter by ECO/opening.
-Batch operations allow fetching across multi-month date ranges concurrently.
+Batch operations allow fetching across multi-month date ranges sequentially.
 """
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from typing import Any
 
@@ -197,7 +196,7 @@ def get_games_by_opening(
 
 
 # ---------------------------------------------------------------------------
-# Batch operations — multi-month date ranges with concurrent fetching
+# Batch operations — multi-month date ranges with sequential fetching
 # ---------------------------------------------------------------------------
 
 
@@ -243,16 +242,15 @@ def get_games_batch(
     start: date,
     end: date,
     *,
-    max_workers: int = 5,
     time_control: str | None = None,
     since: int | None = None,
 ) -> list[dict[str, Any]]:
     """
-    Fetch games across a multi-month date range using concurrent requests.
+    Fetch games across a multi-month date range using sequential requests.
 
     Makes one API call per month in the range [start, end] (inclusive),
-    running up to *max_workers* requests in parallel via a thread pool.
-    Threads are ideal here because each task is I/O-bound (network wait).
+    iterating through each month one at a time to comply with the
+    Chess.com API's rules against concurrent requests.
 
     Optional client-side filters are applied *after* all months are fetched:
       - *time_control*: keep only games of a specific type (bullet/blitz/rapid/daily)
@@ -264,7 +262,6 @@ def get_games_batch(
     :param username:     Chess.com username.
     :param start:        Start date (day ignored; only year/month used).
     :param end:          End date   (day ignored; only year/month used).
-    :param max_workers:  Max concurrent API requests (default 5).
     :param time_control: Optional filter — "bullet", "blitz", "rapid", or "daily".
     :param since:        Optional Unix epoch — exclude games with end_time <= since.
     :return: Combined list of game dicts, ordered chronologically by month.
@@ -273,33 +270,10 @@ def get_games_batch(
     """
     months = _month_range(start, end)
 
-    # Single month: skip thread-pool overhead entirely
-    if len(months) == 1:
-        y, m = months[0]
-        all_games = get_games(username, y, m)
-    else:
-        # Fan out one request per month across the thread pool
-        results: dict[tuple[int, int], list[dict[str, Any]]] = {}
-
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all months at once — the pool caps concurrency at max_workers
-            future_to_month = {
-                executor.submit(get_games, username, y, m): (y, m)
-                for y, m in months
-            }
-
-            # Collect results as they complete (order doesn't matter yet)
-            for future in as_completed(future_to_month):
-                month_key = future_to_month[future]
-                # .result() re-raises any exception the worker hit.
-                # In strict mode this means one bad month kills the whole batch.
-                results[month_key] = future.result()
-
-        # Reassemble in chronological order — as_completed returns in *finish*
-        # order, not submission order, so we iterate over the original month list.
-        all_games = []
-        for ym in months:
-            all_games.extend(results[ym])
+    # Fetch each month sequentially and append results in chronological order
+    all_games: list[dict[str, Any]] = []
+    for y, m in months:
+        all_games.extend(get_games(username, y, m))
 
     # Apply optional client-side filters
     out = all_games
@@ -316,19 +290,17 @@ def get_games_batch_by_opening(
     opening: str,
     start: date,
     end: date,
-    *,
-    max_workers: int = 5,
 ) -> list[dict[str, Any]]:
     """
-    Fetch games across a date range and filter by opening — concurrently.
+    Fetch games across a date range and filter by opening.
 
     Composes two existing pieces:
-      1. get_games_batch  — concurrent multi-month fetch
+      1. get_games_batch  — sequential multi-month fetch
       2. _eco_matches     — client-side opening filter
 
-    The filtering happens locally *after* all months have been fetched,
-    so the network calls are fully parallelized and the filter adds
-    negligible overhead (it's just string matching on already-fetched data).
+    The filtering happens locally *after* all months have been fetched.
+    The filter adds negligible overhead (just string matching on
+    already-fetched data).
 
     :param username:    Chess.com username.
     :param opening:     ECO code (e.g. "B07") or opening name substring
@@ -336,12 +308,11 @@ def get_games_batch_by_opening(
                         matches all games (no filter applied).
     :param start:       Start date (day ignored; only year/month used).
     :param end:         End date   (day ignored; only year/month used).
-    :param max_workers: Max concurrent API requests (default 5).
     :return: Filtered list of game dicts, in chronological month order.
     :raises ValueError:          If start is after end.
     :raises requests.HTTPError:  If any month's API request fails (strict).
     """
-    all_games = get_games_batch(username, start, end, max_workers=max_workers)
+    all_games = get_games_batch(username, start, end)
     # Filter locally — _eco_matches handles empty/whitespace opening gracefully
     return [g for g in all_games if _eco_matches(g, opening)]
 

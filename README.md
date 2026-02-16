@@ -5,7 +5,7 @@ A Python library that extends the [Chess.com public API](https://www.chess.com/n
 ## Features
 
 - **Games by opening** — filter by ECO code (`"B07"`) or opening name substring (`"Caro-Kann"`)
-- **Batch fetching** — concurrent multi-month game retrieval via thread pool
+- **Batch fetching** — sequential multi-month game retrieval across date ranges
 - **Time control filters** — narrow results to bullet, blitz, rapid, or daily
 - **Recent losses** — walk backwards through months to find your latest losses
 - **Player stats** — current ratings and W/L/D records across all formats
@@ -57,13 +57,13 @@ caro_in_year = get_games_by_opening("cdew4", "Caro-Kann", 2026)
 
 Each game is a dict with the same shape as the Chess.com API: `url`, `pgn`, `white`, `black`, `eco`, `time_control`, `fen`, etc.
 
-### Batch fetch (concurrent)
+### Batch fetch (multi-month)
 
 ```python
 from datetime import date
 from chesscompy import get_games_batch, get_games_batch_by_opening
 
-# Fetch Oct 2025 through Jan 2026 concurrently (one request per month)
+# Fetch Oct 2025 through Jan 2026 sequentially (one request per month)
 all_games = get_games_batch("cdew4", date(2025, 10, 1), date(2026, 1, 31))
 
 # With filters: only blitz games since a Unix timestamp

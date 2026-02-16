@@ -21,9 +21,6 @@ Usage examples:
     # Incremental fetch: only games after a given Unix timestamp
     python cli.py cdew4 2025-10 2026-01 --since 1704067200
 
-    # With custom concurrency limit
-    python cli.py cdew4 2025-10 2026-01 --workers 3
-
     # Combine filters
     python cli.py cdew4 2025-10 2026-01 --time-control rapid --losses-only -v
 
@@ -126,12 +123,6 @@ def main() -> None:
         help="End month as YYYY-MM (default: same as start)",
     )
     parser.add_argument(
-        "--workers", "-w",
-        type=int,
-        default=5,
-        help="Max concurrent API requests (default: 5)",
-    )
-    parser.add_argument(
         "--opening", "-o",
         type=str,
         default="",
@@ -182,7 +173,7 @@ def main() -> None:
         f"Fetching games for '{args.username}' "
         f"from {args.start.year}-{args.start.month:02d} "
         f"to {end.year}-{end.month:02d} "
-        f"(max_workers={args.workers}{filter_desc})..."
+        f"(sequential{filter_desc})..."
     )
 
     t0 = time.perf_counter()
@@ -192,12 +183,10 @@ def main() -> None:
         if args.opening:
             games = get_games_batch_by_opening(
                 args.username, args.opening, args.start, end,
-                max_workers=args.workers,
             )
         else:
             games = get_games_batch(
                 args.username, args.start, end,
-                max_workers=args.workers,
                 time_control=args.time_control,
                 since=args.since,
             )

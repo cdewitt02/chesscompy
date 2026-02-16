@@ -11,18 +11,16 @@ Design notes:
     data dynamically from the response so test names stay data-agnostic.
   - Two tests exercise get_games_by_opening end-to-end (extra API calls).
   - _month_range tests are pure unit tests (no network calls).
-  - get_games_batch tests hit the live API with a small range.
+  - get_games_batch tests hit the live API with a small date range.
 """
 
 import re
 from datetime import date
 from typing import Any
-from unittest.mock import patch
-
 import pytest
 import requests
 
-from chesscompy.exceptions import ChessComAPIError, PlayerNotFoundError
+from chesscompy.exceptions import PlayerNotFoundError
 from chesscompy.games import (
     _eco_matches,
     _is_loss,
@@ -421,27 +419,6 @@ class TestGetGamesBatch:
                 date(YEAR, MONTH, 1),
                 date(YEAR, MONTH, 1),
             )
-
-    def test_strict_error_propagates_from_concurrent_workers(self):
-        """
-        When one month in a multi-month batch fails, strict mode should
-        propagate the exception even though other months may succeed.
-
-        We mock one of the months to fail while the other would succeed.
-        """
-        def failing_get_games(username, year, month):
-            """Simulate the second month failing with a ChessComAPIError."""
-            if month == 2:
-                raise ChessComAPIError("Simulated failure for month 2")
-            return get_games(username, year, month)
-
-        with patch("chesscompy.games.get_games", side_effect=failing_get_games):
-            with pytest.raises(ChessComAPIError):
-                get_games_batch(
-                    USERNAME,
-                    date(YEAR, MONTH, 1),
-                    date(YEAR, 2, 1),
-                )
 
 
 # ---------------------------------------------------------------------------
