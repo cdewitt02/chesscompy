@@ -33,7 +33,7 @@ from chesscompy.exceptions import (
 )
 
 # Chess.com expects a descriptive User-Agent; see their API guidelines
-DEFAULT_USER_AGENT = "chesscompy/0.1.0 (Python; Chess.com API extension)"
+DEFAULT_USER_AGENT = "chesscompy/0.2.0 (Python; Chess.com API extension)"
 
 BASE_URL = "https://api.chess.com/pub"
 

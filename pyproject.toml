@@ -4,15 +4,31 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "chesscompy"
-version = "0.1.0"
-description = "Python library extending the Chess.com public API (e.g. games by opening)"
+version = "0.2.0"
+description = "Python library extending the Chess.com public API — batch game fetching, opening filters, PGN parsing, stats, and more"
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "MIT" }
-authors = [{ name = "Your Name", email = "you@example.com" }]
+license = "MIT"
+authors = [{ name = "Charlie DeWitt", email = "charliedewitt20@gmail.com" }]
+keywords = ["chess", "chess.com", "api", "opening", "eco", "pgn", "stats", "blitz", "rapid"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Games/Entertainment :: Board Games",
+]
 dependencies = [
     "requests>=2.28",
 ]
+
+[project.urls]
+Homepage = "https://github.com/cdewitt02/chesscompy"
+Repository = "https://github.com/cdewitt02/chesscompy"
+"Bug Tracker" = "https://github.com/cdewitt02/chesscompy/issues"
 
 [project.optional-dependencies]
 dev = [

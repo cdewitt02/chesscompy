@@ -78,4 +78,4 @@ __all__ = [
     "extract_moves",
     "find_time_pressure_moves",
 ]
-__version__ = "0.1.0"
+__version__ = "0.2.0"
